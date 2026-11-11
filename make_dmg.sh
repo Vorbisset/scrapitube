@@ -24,7 +24,12 @@ DMG="dist/$APP_NAME-$VERSION.dmg"
 
 # ffmpeg 9.0.2, version autonome (sans dépendances) de https://ffmpeg.martin-riedl.de
 FFMPEG_BASE="https://ffmpeg.martin-riedl.de/download/macos"
-FFMPEG_BUILDS=("arm64/1789931890_9.0.2" "amd64/1789931006_9.0.2")
+# Empreintes SHA-256 inscrites ici (et non relues sur le serveur) : un fichier modifié
+# en ligne serait refusé.
+FFMPEG_BUILDS=(
+  "arm64/1789931890_9.0.2 c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
+  "amd64/1789931006_9.0.2 7c6b4125b191cbf773832dc51f424cf2b6bb7da43007d1e066f95909e47cacd4"
+)
 
 check_sha256() {  # fichier, empreinte attendue
   local actual
@@ -53,12 +58,12 @@ fi
 if [ ! -x vendor/ffmpeg ]; then
   echo "== Téléchargement de ffmpeg (Apple Silicon + Intel) =="
   SLICES=()
-  for build in "${FFMPEG_BUILDS[@]}"; do
+  for entry in "${FFMPEG_BUILDS[@]}"; do
+    read -r build EXPECTED <<<"$entry"
     arch="${build%%/*}"
     dir="vendor/ffmpeg-$arch"
     mkdir -p "$dir"
     curl -fL --progress-bar "$FFMPEG_BASE/$build/ffmpeg.zip" -o "$dir/ffmpeg.zip"
-    EXPECTED="$(curl -sfL "$FFMPEG_BASE/$build/ffmpeg.zip.sha256" | awk '{print $1}')"
     check_sha256 "$dir/ffmpeg.zip" "$EXPECTED"
     unzip -oq "$dir/ffmpeg.zip" -d "$dir"
     SLICES+=("$dir/ffmpeg")

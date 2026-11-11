@@ -1,12 +1,13 @@
 //! Lancement de yt-dlp : analyse d'un lien, téléchargement et suivi de la progression.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
@@ -39,8 +40,100 @@ impl Container {
     }
 }
 
+/// Navigateur dont yt-dlp réutilise la session YouTube (`--cookies-from-browser`), quand
+/// YouTube exige une connexion (« Sign in to confirm you're not a bot »).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Browser {
+    Safari,
+    Chrome,
+    Firefox,
+    Brave,
+    Edge,
+    Opera,
+    Vivaldi,
+    Chromium,
+}
+
+impl Browser {
+    pub const ALL: [Browser; 8] = [
+        Browser::Safari,
+        Browser::Chrome,
+        Browser::Firefox,
+        Browser::Brave,
+        Browser::Edge,
+        Browser::Opera,
+        Browser::Vivaldi,
+        Browser::Chromium,
+    ];
+
+    /// Nom attendu par `--cookies-from-browser`.
+    fn id(self) -> &'static str {
+        match self {
+            Browser::Safari => "safari",
+            Browser::Chrome => "chrome",
+            Browser::Firefox => "firefox",
+            Browser::Brave => "brave",
+            Browser::Edge => "edge",
+            Browser::Opera => "opera",
+            Browser::Vivaldi => "vivaldi",
+            Browser::Chromium => "chromium",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Browser::Safari => "Safari",
+            Browser::Chrome => "Chrome",
+            Browser::Firefox => "Firefox",
+            Browser::Brave => "Brave",
+            Browser::Edge => "Edge",
+            Browser::Opera => "Opera",
+            Browser::Vivaldi => "Vivaldi",
+            Browser::Chromium => "Chromium",
+        }
+    }
+
+    fn app_name(self) -> &'static str {
+        match self {
+            Browser::Chrome => "Google Chrome",
+            Browser::Brave => "Brave Browser",
+            Browser::Edge => "Microsoft Edge",
+            other => other.label(),
+        }
+    }
+
+    /// Les navigateurs basés sur Chromium chiffrent leurs cookies avec une clé du trousseau :
+    /// macOS demande l'autorisation à la première lecture.
+    pub fn uses_keychain(self) -> bool {
+        !matches!(self, Browser::Safari | Browser::Firefox)
+    }
+
+    /// Navigateurs présents sur ce Mac.
+    pub fn installed() -> Vec<Browser> {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        Self::ALL
+            .into_iter()
+            .filter(|b| {
+                let app = format!("{}.app", b.app_name());
+                Path::new("/Applications").join(&app).exists() || home.join("Applications").join(&app).exists()
+            })
+            .collect()
+    }
+}
+
+/// YouTube refuse de répondre sans session connectée.
+pub fn needs_sign_in(error: &str) -> bool {
+    error.contains("Sign in to confirm") || error.contains("--cookies-from-browser")
+}
+
+/// macOS a empêché yt-dlp de lire les cookies (Safari demande l'« accès complet au disque »).
+pub fn cookies_access_denied(error: &str) -> bool {
+    error.contains("Operation not permitted") || error.contains("PermissionError")
+}
+
 /// Réglages d'un téléchargement (mémorisés d'une session à l'autre).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Options {
     pub mode: Mode,
     /// Hauteur maximale de la vidéo ; `None` = meilleure qualité disponible.
@@ -49,6 +142,16 @@ pub struct Options {
     pub subs: bool,
     pub no_playlist: bool,
     pub output_dir: PathBuf,
+    /// Session YouTube à réutiliser ; `None` = sans connexion.
+    pub cookies_browser: Option<Browser>,
+}
+
+impl Options {
+    fn add_cookies(&self, cmd: &mut Command) {
+        if let Some(browser) = self.cookies_browser {
+            cmd.args(["--cookies-from-browser", browser.id()]);
+        }
+    }
 }
 
 impl Default for Options {
@@ -61,6 +164,7 @@ impl Default for Options {
             subs: false,
             no_playlist: true,
             output_dir: home.join("Movies").join("YouTube"),
+            cookies_browser: None,
         }
     }
 }
@@ -114,20 +218,119 @@ impl Meta {
 }
 
 fn best_thumbnail(v: &Value) -> Option<String> {
-    v.get("thumbnail").and_then(Value::as_str).map(str::to_string).or_else(|| {
+    let candidates = v.get("thumbnail").into_iter().chain(
         // Dans la liste "thumbnails", yt-dlp range les miniatures de la moins bonne à la meilleure.
-        v.get("thumbnails")?.as_array()?.iter().rev().find_map(|t| t.get("url")?.as_str().map(str::to_string))
-    })
+        v.get("thumbnails").and_then(Value::as_array).into_iter().flatten().rev().filter_map(|t| t.get("url")),
+    );
+    candidates.filter_map(Value::as_str).find(|url| trusted_image_url(url)).map(str::to_string)
 }
 
+/// Domaines acceptés dans un lien saisi.
+const YOUTUBE_HOSTS: [&str; 7] = [
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+];
+const MAX_URL_LEN: usize = 2048;
+
+/// Coupe « schéma://hôte/reste » ; l'hôte est mis en minuscules.
+fn split_host(url: &str) -> (String, &str) {
+    let end = url.find(['/', '?', '#']).unwrap_or(url.len());
+    let (host, rest) = url.split_at(end);
+    (host.to_ascii_lowercase(), rest)
+}
+
+/// Vérifie qu'un texte saisi est un lien YouTube et le renvoie en https. Tout le reste est
+/// refusé avant d'atteindre yt-dlp (qui sait aussi lire des centaines d'autres sites).
+pub fn youtube_url(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.len() > MAX_URL_LEN {
+        return Err("Lien trop long.");
+    }
+    if input.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Colle un seul lien à la fois, sans espaces.");
+    }
+    let lower = input.to_ascii_lowercase();
+    // Le schéma est en ASCII : les positions sont les mêmes dans `input` et `lower`.
+    let skip = ["https://", "http://"].iter().find(|s| lower.starts_with(*s)).map_or(0, |s| s.len());
+    let (host, rest) = split_host(&input[skip..]);
+    if host.contains('@') || host.contains(':') {
+        return Err("Lien refusé : il contient un identifiant, un port ou un schéma inconnu.");
+    }
+    if !YOUTUBE_HOSTS.contains(&host.as_str()) {
+        return Err("Ce n'est pas un lien YouTube : Scrapitube n'accepte que youtube.com et youtu.be.");
+    }
+    Ok(format!("https://{host}{rest}"))
+}
+
+/// Miniatures : uniquement en https depuis les serveurs d'images de YouTube / Google.
+fn trusted_image_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let (host, _) = split_host(rest);
+    !host.contains(['@', ':'])
+        && ["ytimg.com", "ggpht.com", "googleusercontent.com"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Options communes à tous les appels de yt-dlp.
+fn harden(cmd: &mut Command) {
+    // Ignore tout fichier de configuration yt-dlp présent sur le Mac (il pourrait, par
+    // exemple, ajouter --exec pour lancer des commandes) et abandonne les connexions muettes.
+    cmd.arg("--ignore-config").args(["--socket-timeout", "30"]);
+}
+
+/// Comme `Command::output`, mais tue yt-dlp s'il dépasse `timeout`.
+fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("impossible de lancer yt-dlp : {e}"))?;
+    let read_all = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let stdout = read_all(Box::new(child.stdout.take().expect("stdout capturé")));
+    let stderr = read_all(Box::new(child.stderr.take().expect("stderr capturé")));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("YouTube ne répond pas (délai dépassé). Réessaie dans un moment.".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    Ok(Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
+}
+
+const ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Analyse un lien sans rien télécharger (titre, miniature, durée, qualités…).
-pub fn analyze(yt_dlp: &Path, url: &str, no_playlist: bool) -> Result<Meta, String> {
+pub fn analyze(yt_dlp: &Path, url: &str, options: &Options) -> Result<Meta, String> {
+    let url = youtube_url(url).map_err(str::to_string)?;
     let mut cmd = Command::new(yt_dlp);
+    harden(&mut cmd);
     cmd.args(["-J", "--no-warnings", "--flat-playlist"]);
-    if no_playlist {
+    if options.no_playlist {
         cmd.arg("--no-playlist");
     }
-    let out = cmd.arg(url).output().map_err(|e| format!("impossible de lancer yt-dlp : {e}"))?;
+    options.add_cookies(&mut cmd);
+    // « -- » : le lien ne peut jamais être pris pour une option de yt-dlp.
+    cmd.arg("--").arg(&url);
+    let out = output_with_timeout(cmd, ANALYZE_TIMEOUT)?;
     if !out.status.success() {
         return Err(error_message(String::from_utf8_lossy(&out.stderr).lines()));
     }
@@ -280,6 +483,8 @@ pub fn install_bundled_tools() {
     if std::fs::create_dir_all(&dst).is_err() {
         return;
     }
+    // Dossier de programmes exécutés par l'appli : lisible et modifiable par toi seul.
+    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700));
     for name in ["yt-dlp", "ffmpeg"] {
         let (from, to) = (src.join(name), dst.join(name));
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
@@ -343,6 +548,7 @@ const SIZE_TAG: &str = "__SIZE__";
 fn build_command(yt_dlp: &Path, request: &Request) -> Command {
     let options = &request.options;
     let mut cmd = Command::new(yt_dlp);
+    harden(&mut cmd);
 
     // Un extrait porte ses bornes dans le nom, pour ne pas écraser la vidéo complète.
     let suffix = request
@@ -391,6 +597,7 @@ fn build_command(yt_dlp: &Path, request: &Request) -> Command {
     if let Some(ffmpeg) = ffmpeg_location() {
         cmd.arg("--ffmpeg-location").arg(ffmpeg);
     }
+    options.add_cookies(&mut cmd);
     if options.subs {
         cmd.args(["--write-subs", "--sub-langs", "fr,en", "--embed-subs"]);
     }
@@ -398,7 +605,8 @@ fn build_command(yt_dlp: &Path, request: &Request) -> Command {
         cmd.arg("--no-playlist");
     }
 
-    cmd.arg(&request.url);
+    // « -- » : le lien ne peut jamais être pris pour une option de yt-dlp.
+    cmd.arg("--").arg(&request.url);
     cmd
 }
 
@@ -440,13 +648,17 @@ fn run(
     }
 }
 
-/// Garde les lignes "ERROR:" de yt-dlp, sans le préfixe.
+/// Garde les lignes "ERROR:" de yt-dlp, sans le préfixe. À défaut (plantage Python, par
+/// exemple un accès refusé aux cookies), renvoie la dernière ligne non vide.
 fn error_message<'a>(lines: impl Iterator<Item = &'a str>) -> String {
-    let errors: Vec<&str> = lines.filter_map(|l| l.strip_prefix("ERROR: ")).collect();
-    if errors.is_empty() {
-        "yt-dlp s'est arrêté sans donner de raison".into()
-    } else {
+    let lines: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+    let errors: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix("ERROR: ")).collect();
+    if !errors.is_empty() {
         errors.join("\n")
+    } else if let Some(last) = lines.last() {
+        last.to_string()
+    } else {
+        "yt-dlp s'est arrêté sans donner de raison".into()
     }
 }
 
@@ -556,5 +768,91 @@ mod tests {
         assert_eq!(p.eta, Some(18.0));
         feed(&mut p, &["progress=end", "__PROG__1000|1000|NA|NA|NA"]);
         assert_eq!(p.status, Status::Converting);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn recognises_sign_in_and_permission_errors() {
+        let bot = "[youtube] 20MIPjsuwNQ: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies";
+        assert!(needs_sign_in(bot));
+        assert!(!needs_sign_in("Video unavailable"));
+        assert!(cookies_access_denied("PermissionError: [Errno 1] Operation not permitted: '…/Cookies.binarycookies'"));
+    }
+
+    #[test]
+    fn error_message_falls_back_to_last_line() {
+        assert_eq!(error_message(["WARNING: x", "ERROR: boom"].into_iter()), "boom");
+        assert_eq!(error_message(["Traceback", "PermissionError: nope", ""].into_iter()), "PermissionError: nope");
+    }
+
+    #[test]
+    fn old_settings_without_cookies_still_load() {
+        let json = r#"{"mode":"Audio","max_height":720,"container":"Mkv","subs":true,"no_playlist":false,"output_dir":"/tmp"}"#;
+        let options: Options = serde_json::from_str(json).unwrap();
+        assert_eq!(options.mode, Mode::Audio);
+        assert_eq!(options.cookies_browser, None);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_youtube_links() {
+        assert_eq!(youtube_url("https://www.youtube.com/watch?v=abc").unwrap(), "https://www.youtube.com/watch?v=abc");
+        assert_eq!(youtube_url("youtu.be/abc?t=3").unwrap(), "https://youtu.be/abc?t=3");
+        assert_eq!(youtube_url("  HTTP://M.YouTube.com/watch?v=x ").unwrap(), "https://m.youtube.com/watch?v=x");
+        assert!(youtube_url("https://music.youtube.com/playlist?list=PL1").is_ok());
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "https://evil.com/watch?v=abc",
+            "https://youtube.com.evil.com/x",
+            "https://notyoutube.com/x",
+            "https://www.youtube.com@evil.com/x",
+            "https://www.youtube.com:8080/x",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "--exec=rm",
+            "https://youtu.be/a --exec rm",
+            "https://youtu.be/a\nb",
+            "",
+        ] {
+            assert!(youtube_url(bad).is_err(), "devrait être refusé : {bad:?}");
+        }
+        assert!(youtube_url(&format!("https://youtu.be/{}", "a".repeat(3000))).is_err());
+    }
+
+    #[test]
+    fn thumbnails_only_from_youtube_image_servers() {
+        assert!(trusted_image_url("https://i.ytimg.com/vi/x/hqdefault.jpg"));
+        assert!(trusted_image_url("https://yt3.ggpht.com/a.jpg"));
+        assert!(!trusted_image_url("http://i.ytimg.com/vi/x.jpg"));
+        assert!(!trusted_image_url("https://ytimg.com.evil.com/x.jpg"));
+        assert!(!trusted_image_url("https://evil.com/x.jpg"));
+        let json = serde_json::json!({"thumbnail": "https://evil.com/a.jpg",
+            "thumbnails": [{"url": "https://i.ytimg.com/low.jpg"}, {"url": "https://evil.com/best.jpg"}]});
+        assert_eq!(best_thumbnail(&json).as_deref(), Some("https://i.ytimg.com/low.jpg"));
+    }
+
+    #[test]
+    fn url_always_follows_double_dash() {
+        let request = Request {
+            url: "https://youtu.be/abc".into(),
+            options: Options::default(),
+            section: None,
+            meta: Meta::default(),
+        };
+        let cmd = build_command(Path::new("yt-dlp"), &request);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[args.len() - 2..], ["--", "https://youtu.be/abc"]);
+        assert!(args.contains(&"--ignore-config".to_string()));
     }
 }

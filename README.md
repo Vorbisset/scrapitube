@@ -104,12 +104,34 @@ validation (quelques minutes) et y joint le ticket de notarisation.
   playlist » pour tout récupérer (sinon seule la vidéo est téléchargée).
 - Dossier par défaut : `~/Movies/YouTube`. Les réglages sont mémorisés.
 
+## Sécurité
+
+- Seuls les liens `youtube.com` / `youtu.be` sont acceptés (en https) ; les liens
+  avec identifiant, port ou schéma inconnu sont refusés avant d'atteindre yt-dlp.
+- yt-dlp est lancé sans shell, avec `--ignore-config` (aucun fichier de
+  configuration externe ne peut lui ajouter `--exec`), `--socket-timeout 30` et le
+  lien placé après `--` (il ne peut pas être pris pour une option).
+- Les miniatures ne sont chargées qu'en https depuis les serveurs d'images de
+  YouTube (`ytimg.com`, `ggpht.com`, `googleusercontent.com`).
+- Les outils copiés dans `~/Library/Application Support/Scrapitube/bin` sont dans
+  un dossier accessible à toi seul (permissions 700).
+- L'appli est signée avec le *hardened runtime* de macOS (bloque l'injection de
+  bibliothèques) ; les empreintes SHA-256 de FFmpeg sont fixées dans
+  `make_dmg.sh`, celle de yt-dlp vient de la release officielle.
+- La session YouTube (option « Session YouTube ») est lue par yt-dlp directement
+  dans le navigateur choisi ; Scrapitube ne la stocke ni ne l'envoie ailleurs.
+
 ## Dépannage
 
 - **« yt-dlp introuvable »** : `brew install yt-dlp`, puis « Réessayer » en bas
   de la fenêtre.
 - **Un lien qui marchait ne marche plus** : YouTube change souvent ses
-  protections, mets yt-dlp à jour : `brew upgrade yt-dlp`.
+  protections, clique sur « Mettre à jour yt-dlp » en bas de la fenêtre (ou
+  `brew upgrade yt-dlp` si tu utilises celui de Homebrew).
+- **« Sign in to confirm you're not a bot »** : choisis, dans « Session YouTube »
+  en bas de la fenêtre, un navigateur où tu es connecté à YouTube. Avec Chrome,
+  Brave ou Edge, autorise l'accès au trousseau ; avec Safari, donne à Scrapitube
+  l'« accès complet au disque ».
 
 Pour un usage personnel : respecte les droits d'auteur et les conditions
 d'utilisation de YouTube.

@@ -1,6 +1,6 @@
 [package]
 name = "scrapitube"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Scrapitube : appli de bureau pour télécharger des vidéos YouTube (surcouche à yt-dlp)"
 
@@ -15,3 +15,4 @@ serde_json = "1"
 
 [profile.release]
 strip = true
+overflow-checks = true

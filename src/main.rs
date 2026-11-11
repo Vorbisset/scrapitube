@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use eframe::egui::{self, Align, Button, Color32, Key, Layout, ProgressBar, RichText, TextEdit, Vec2};
 
-use download::{Container, Job, Meta, Mode, Options, Progress, Request, Section, Status};
+use download::{Browser, Container, Job, Meta, Mode, Options, Progress, Request, Section, Status};
 
 const APP_NAME: &str = "Scrapitube";
 const LOGO: &[u8] = include_bytes!("../assets/icon.png");
@@ -76,8 +76,9 @@ struct App {
     options: Options,
     url_input: String,
     edited_at: Option<Instant>,
-    /// Lien (et réglage playlist) correspondant à l'aperçu affiché.
-    analyzed: Option<(String, bool)>,
+    /// Lien (avec les réglages playlist et session) correspondant à l'aperçu affiché.
+    analyzed: Option<(String, bool, Option<Browser>)>,
+    browsers: Vec<Browser>,
     preview: Preview,
     analysis: Option<mpsc::Receiver<Result<Meta, String>>>,
     clip: Clip,
@@ -106,6 +107,7 @@ impl App {
             url_input: String::new(),
             edited_at: None,
             analyzed: None,
+            browsers: Browser::installed(),
             preview: Preview::Empty,
             analysis: None,
             clip: Clip::default(),
@@ -164,22 +166,45 @@ impl App {
                     self.has_ffmpeg = download::has_ffmpeg();
                 }
             }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = self.options.cookies_browser.map_or("Aucune", Browser::label);
+                egui::ComboBox::from_id_salt("cookies")
+                    .selected_text(label)
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.options.cookies_browser, None, "Aucune");
+                        for &browser in &self.browsers {
+                            ui.selectable_value(&mut self.options.cookies_browser, Some(browser), browser.label());
+                        }
+                    });
+                ui.label(RichText::new("Session YouTube :").small().color(theme::MUTED))
+                    .on_hover_text("Navigateur dont Scrapitube réutilise la connexion YouTube, si YouTube demande de prouver que tu n'es pas un robot.");
+            });
         });
     }
 
     fn url(&self) -> Option<String> {
-        normalize_url(&self.url_input)
+        download::youtube_url(&self.url_input).ok()
     }
 
     /// Lance l'analyse du lien saisi s'il a changé (une fois la frappe terminée).
     fn maybe_analyze(&mut self, ctx: &egui::Context) {
-        let Some(url) = self.url() else {
-            self.preview = Preview::Empty;
-            self.analyzed = None;
-            self.analysis = None;
-            return;
+        let url = match download::youtube_url(&self.url_input) {
+            Ok(url) => url,
+            Err(reason) => {
+                // Champ vide : aperçu d'accueil ; lien refusé : on dit pourquoi.
+                self.preview = if self.url_input.trim().is_empty() {
+                    Preview::Empty
+                } else {
+                    Preview::Failed(reason.to_string())
+                };
+                self.analyzed = None;
+                self.analysis = None;
+                return;
+            }
         };
-        let key = (url.clone(), self.options.no_playlist);
+        let key = (url.clone(), self.options.no_playlist, self.options.cookies_browser);
         if self.analyzed.as_ref() == Some(&key) {
             return;
         }
@@ -190,9 +215,9 @@ impl App {
         let Some((yt_dlp, _)) = self.yt_dlp.clone() else { return };
 
         let (tx, rx) = mpsc::channel();
-        let (ctx, no_playlist) = (ctx.clone(), self.options.no_playlist);
+        let (ctx, options) = (ctx.clone(), self.options.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(download::analyze(&yt_dlp, &url, no_playlist));
+            let _ = tx.send(download::analyze(&yt_dlp, &url, &options));
             ctx.request_repaint();
         });
         // Remplacer le récepteur ignore le résultat d'une analyse précédente encore en cours.
@@ -285,6 +310,84 @@ impl App {
         });
     }
 
+    /// YouTube exige une session connectée : propose les navigateurs installés.
+    fn sign_in_help(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("YouTube demande de vérifier que tu n'es pas un robot").font(theme::bold(19.0)).color(theme::WARNING));
+            ui.label(
+                RichText::new(
+                    "Scrapitube peut réutiliser ta session YouTube. Choisis un navigateur dans lequel tu es \
+                     connecté à YouTube (ouvre youtube.com pour vérifier) :",
+                )
+                .color(theme::MUTED),
+            );
+            ui.add_space(6.0);
+            if self.browsers.is_empty() {
+                ui.label(RichText::new("Aucun navigateur compatible trouvé dans Applications.").color(theme::DANGER));
+            }
+            ui.horizontal_wrapped(|ui| {
+                for &browser in &self.browsers {
+                    let selected = self.options.cookies_browser == Some(browser);
+                    let text = RichText::new(browser.label()).font(theme::bold(15.0)).color(Color32::WHITE);
+                    let button = Button::new(text)
+                        .fill(if selected { theme::ACCENT } else { theme::SURFACE_HOVER })
+                        .min_size(egui::vec2(110.0, 38.0));
+                    if ui.add(button).clicked() {
+                        self.options.cookies_browser = Some(browser);
+                        self.analyzed = None;
+                    }
+                }
+            });
+            if let Some(browser) = self.options.cookies_browser {
+                ui.label(
+                    RichText::new(format!(
+                        "YouTube refuse encore avec {} : vérifie que tu y es bien connecté à YouTube, ou essaie un autre navigateur.",
+                        browser.label()
+                    ))
+                    .color(theme::MUTED),
+                );
+            }
+            if self.browsers.iter().any(|b| b.uses_keychain()) {
+                ui.label(
+                    RichText::new("Avec Chrome, Brave ou Edge, macOS demandera l'accès au trousseau : clique sur « Toujours autoriser ».")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+        });
+    }
+
+    /// macOS a refusé l'accès aux cookies (cas de Safari sans « accès complet au disque »).
+    fn cookies_access_help(&mut self, ui: &mut egui::Ui, error: &str) {
+        let browser = self.options.cookies_browser.map_or("ce navigateur", Browser::label);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(format!("macOS bloque l'accès à la session {browser}")).font(theme::bold(19.0)).color(theme::WARNING));
+            if self.options.cookies_browser == Some(Browser::Safari) {
+                ui.label(
+                    RichText::new(
+                        "Pour lire la session Safari, Scrapitube a besoin de l'« accès complet au disque » : \
+                         Réglages Système → Confidentialité et sécurité → Accès complet au disque → active Scrapitube \
+                         (ajoute-la avec « + » si besoin), puis relance l'appli.",
+                    )
+                    .color(theme::MUTED),
+                );
+                if ui.button("Ouvrir les réglages").clicked() {
+                    open(&["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]);
+                }
+            } else {
+                ui.label(RichText::new(error).color(theme::MUTED));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Réessayer").clicked() {
+                    self.analyzed = None;
+                }
+                if ui.button("Choisir un autre navigateur").clicked() {
+                    self.options.cookies_browser = None;
+                }
+            });
+        });
+    }
+
     fn preview_card(&mut self, ui: &mut egui::Ui) {
         theme::card().inner_margin(22.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -316,13 +419,19 @@ impl App {
                 Preview::Failed(error) => {
                     let error = error.clone();
                     ui.add_space(16.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Impossible de lire ce lien").font(theme::bold(19.0)).color(theme::DANGER));
-                        ui.label(RichText::new(error).color(theme::MUTED));
-                        if ui.button("Réessayer").clicked() {
-                            self.analyzed = None;
-                        }
-                    });
+                    if download::needs_sign_in(&error) {
+                        self.sign_in_help(ui);
+                    } else if self.options.cookies_browser.is_some() && download::cookies_access_denied(&error) {
+                        self.cookies_access_help(ui, &error);
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Impossible de lire ce lien").font(theme::bold(19.0)).color(theme::DANGER));
+                            ui.label(RichText::new(error).color(theme::MUTED));
+                            if ui.button("Réessayer").clicked() {
+                                self.analyzed = None;
+                            }
+                        });
+                    }
                     ui.add_space(16.0);
                 }
                 Preview::Ready(meta) => {
@@ -485,7 +594,12 @@ impl App {
 
         match action {
             Some(JobAction::Cancel(i)) => self.jobs[i].cancel(),
-            Some(JobAction::Retry(i)) => self.jobs[i] = Job::new(self.jobs[i].request.clone()),
+            Some(JobAction::Retry(i)) => {
+                // Reprend la session YouTube choisie entre-temps (cas « not a bot »).
+                let mut request = self.jobs[i].request.clone();
+                request.options.cookies_browser = self.options.cookies_browser;
+                self.jobs[i] = Job::new(request);
+            }
             Some(JobAction::Remove(i)) => {
                 self.jobs.remove(i);
             }
@@ -755,6 +869,10 @@ fn details_line(request: &Request, p: &Progress) -> (String, Color32) {
                 parts.push(format!("{} fichiers", p.files.len()));
             }
         }
+        Status::Failed(e) if download::needs_sign_in(e) => {
+            let text = "YouTube demande une connexion : choisis un navigateur dans « Session YouTube » (en bas), puis Réessayer.";
+            return (text.into(), theme::WARNING);
+        }
         Status::Failed(e) => return (e.clone(), theme::DANGER),
         Status::Cancelled => parts.push("annulé".into()),
     }
@@ -778,21 +896,6 @@ fn download_label(options: &Options, meta: &Meta, clip: Option<&Clip>) -> String
             format!("Télécharger l'extrait ({} – {})", timecode::format(c.start), timecode::format(c.end))
         }
         _ => format!("Télécharger {what}"),
-    }
-}
-
-/// Accepte un lien complet ou sans « https:// » (ex. « youtu.be/… »).
-fn normalize_url(input: &str) -> Option<String> {
-    let input = input.trim();
-    if input.contains(char::is_whitespace) || !input.contains('.') {
-        return None;
-    }
-    if input.starts_with("https://") || input.starts_with("http://") {
-        Some(input.to_string())
-    } else if input.contains("youtu") {
-        Some(format!("https://{input}"))
-    } else {
-        None
     }
 }
 

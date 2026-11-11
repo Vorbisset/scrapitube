@@ -112,7 +112,13 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
 else
   # Signature « ad hoc » (sans compte développeur Apple) : obligatoire pour qu'un binaire
   # Apple Silicon se lance, et qui garde le paquet cohérent une fois copié sur un autre Mac.
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null 2>&1
+  # Les outils embarqués d'abord, puis l'appli avec le hardened runtime (bloque l'injection
+  # de bibliothèques, par exemple via DYLD_INSERT_LIBRARIES).
+  for tool in "$APP_DIR"/Contents/Resources/bin/*; do
+    [ -f "$tool" ] && codesign --force --sign - "$tool"
+  done
+  codesign --force --options runtime --sign - "$APP_DIR"
+  codesign --verify --strict "$APP_DIR"
 fi
 
 if [ "$INSTALL" = 1 ]; then
